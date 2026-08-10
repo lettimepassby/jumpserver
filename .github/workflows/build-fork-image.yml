@@ -20,7 +20,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: ghcr-${{ github.event.workflow_run.head_branch || github.event.ref || inputs.ref || github.ref_name }}
+  group: ghcr-${{ github.event.workflow_run.head_sha || inputs.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -32,6 +32,7 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Resolve source revision
@@ -100,6 +101,7 @@ jobs:
             echo "branch_tag=${branch_tag}"
             echo "immutable_tag=${immutable_tag}"
             echo "version=${branch_tag}-${short_sha}"
+            echo "revision=${commit_sha}"
             echo "tags<<EOF"
             echo "${image}:${branch_tag}"
             echo "${image}:${immutable_tag}"
@@ -145,7 +147,7 @@ jobs:
           tags: ${{ steps.image.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.source.outputs.ref }}
+            org.opencontainers.image.revision=${{ steps.image.outputs.revision }}
           cache-from: type=gha,scope=jumpserver-core
           cache-to: type=gha,mode=max,scope=jumpserver-core
 
