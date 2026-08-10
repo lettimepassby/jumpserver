@@ -1,0 +1,167 @@
+name: Build Fork Image to GHCR
+
+on:
+  create:
+  workflow_run:
+    workflows:
+      - JumpServer repos generic handler
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit SHA to build
+        required: true
+        default: dev
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-${{ github.event.workflow_run.head_branch || github.event.ref || inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'create' && github.event.ref_type == 'branch') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve source revision
+        id: source
+        shell: bash
+        env:
+          CREATE_REF: ${{ github.event.ref }}
+          MANUAL_REF: ${{ inputs.ref }}
+          WORKFLOW_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_run)
+              source_ref="${WORKFLOW_RUN_SHA}"
+              source_branch="${WORKFLOW_RUN_BRANCH}"
+              ;;
+            create)
+              source_ref="${CREATE_REF}"
+              source_branch="${CREATE_REF}"
+              ;;
+            workflow_dispatch)
+              source_ref="${MANUAL_REF}"
+              source_branch="${MANUAL_REF}"
+              ;;
+          esac
+
+          echo "ref=${source_ref}" >> "${GITHUB_OUTPUT}"
+          echo "branch=${source_branch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Prepare image metadata
+        id: image
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repository="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          branch_tag="$(
+            printf '%s' "${SOURCE_BRANCH}" |
+              tr '[:upper:]' '[:lower:]' |
+              sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//' |
+              cut -c1-90
+          )"
+          commit_sha="$(git rev-parse HEAD)"
+          short_sha="${commit_sha:0:12}"
+
+          if [ -z "${branch_tag}" ]; then
+            branch_tag="sha-${short_sha}"
+          fi
+
+          image="ghcr.io/${owner}/${repository}"
+          immutable_tag="${branch_tag}-sha-${short_sha}"
+
+          {
+            echo "image=${image}"
+            echo "branch_tag=${branch_tag}"
+            echo "immutable_tag=${immutable_tag}"
+            echo "version=${branch_tag}-${short_sha}"
+            echo "tags<<EOF"
+            echo "${image}:${branch_tag}"
+            echo "${image}:${immutable_tag}"
+            if [ "${SOURCE_BRANCH}" = "dev" ]; then
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this revision is already published
+        id: published
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect \
+            "${{ steps.image.outputs.image }}:${{ steps.image.outputs.immutable_tag }}" \
+            >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build and push image
+        if: steps.published.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.ref }}
+          cache-from: type=gha,scope=jumpserver-core
+          cache-to: type=gha,mode=max,scope=jumpserver-core
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          {
+            echo "### GHCR image"
+            echo
+            echo "Source: \`${{ steps.source.outputs.branch }}\`"
+            echo
+            echo "Image: \`${{ steps.image.outputs.image }}:${{ steps.image.outputs.branch_tag }}\`"
+            echo
+            if [ "${{ steps.published.outputs.exists }}" = "true" ]; then
+              echo "The immutable image tag already existed, so the build was skipped."
+            else
+              echo "The image was built and pushed successfully."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
